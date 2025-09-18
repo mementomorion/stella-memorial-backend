@@ -10,6 +10,67 @@ const cors = require('cors');
 
 const app = express();
 
+// ⚡️ этот роут вынеси ВЫШЕ всех app.use('/api/:category', ensureTable,...)
+app.get('/bot', async (req, res) => {
+  try {
+    console.log('--- /bot endpoint called ---');
+    console.log('Query params received:', req.query);
+
+    const { Name, Phone, Email, Type, Message } = req.query;
+
+    if (!Name || !Phone) {
+      console.warn('Missing required fields:', { Name, Phone });
+      return res.status(400).json({ error: "Имя и телефон обязательны" });
+    }
+
+    const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8219876383:AAGMovmnKsqXLgEdJ-F4_XNC_GwVaevynGE";
+    const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "-4922810294";
+
+    console.log('Using bot token:', TELEGRAM_BOT_TOKEN);
+    console.log('Sending to chat ID:', TELEGRAM_CHAT_ID);
+
+    const text = `
+📩 *Новая заявка с сайта*  
+
+👤 Имя: ${Name}  
+📞 Телефон: ${Phone}  
+📧 Email: ${Email || "-"}  
+📦 Тип: ${Type || "-"}  
+💬 Сообщение: ${Message || "-"}
+`;
+    console.log('Message to send:', text);
+
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "Markdown"
+      })
+    });
+
+    console.log('Raw fetch response:', response);
+
+    const data = await response.json();
+    console.log('Telegram API response:', data);
+
+    if (!data.ok) {
+      console.error("Telegram reported an error:", data);
+      return res.status(500).json({ error: "Не удалось отправить сообщение в Telegram", details: data });
+    }
+
+    res.json({ success: true, messageId: data.result.message_id });
+  } catch (e) {
+    console.error("Ошибка /bot:", e);
+    res.status(500).json({ error: "Ошибка сервера", details: e.message });
+  }
+});
+
+
+
+
 // CORS
 app.use(cors({
   origin: "*",  // <- разрешает все домены
