@@ -7,6 +7,9 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
@@ -69,7 +72,8 @@ app.get('/bot', async (req, res) => {
 });
 
 
-
+const JWT_SECRET = process.env.JWT_SECRET || 'replace_this_with_strong_secret';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '12h'; // пример
 
 // CORS
 app.use(cors({
@@ -86,6 +90,69 @@ app.use((req, res, next) => {
 });
 app.use(express.json()); // для парсинга JSON в POST/PUT запросах
 app.use(express.urlencoded({ extended: true })); // если будут формы
+
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // max 10 requests per minute per IP
+  message: { error: 'Слишком много попыток, попробуйте позже' }
+});
+
+function authenticateJWT(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const [scheme, token] = authHeader.split(' ');
+  if (scheme !== 'Bearer' || !token) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload; // { id, username, role, iat, exp }
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Middleware: только админ
+function ensureAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+// Логин -> выдаёт JWT
+app.post('/admin/login', authLimiter, async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+
+    // Попытка: сначала проверим таблицу users
+    const r = await db.query('SELECT id, username, password_hash, role FROM users WHERE username=$1 LIMIT 1', [username]);
+
+    if (r.rowCount) {
+      const user = r.rows[0];
+      const match = await bcrypt.compare(password, user.password_hash);
+      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+      const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+      return res.json({ token, expiresIn: JWT_EXPIRES_IN });
+    }
+
+    // Если пользователя нет в БД — можно использовать fallback через env (удобно при одном админе)
+    const ENV_ADMIN_USER = process.env.ADMIN_USERNAME;
+    const ENV_ADMIN_PASS = process.env.ADMIN_PASSWORD;
+    if (ENV_ADMIN_USER && ENV_ADMIN_PASS && username === ENV_ADMIN_USER) {
+      const match = (password === ENV_ADMIN_PASS);
+      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      // WARNING: env password is plain text; recommend hashing in env or create user in DB after first login
+      const token = jwt.sign({ id: 'env-admin', username: ENV_ADMIN_USER, role: 'admin' }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+      return res.json({ token, expiresIn: JWT_EXPIRES_IN });
+    }
+
+    return res.status(401).json({ error: 'Invalid credentials' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Upload images
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -107,17 +174,15 @@ const upload = multer({
     else cb(new Error('Только изображения разрешены'));
   }
 });
-app.post('/api/upload', upload.array('files'), (req, res) => {
+// защита: только админ может грузить файлы
+app.post('/api/upload', authenticateJWT, ensureAdmin, upload.array('files'), (req, res) => {
   if (!req.files || !req.files.length) {
     return res.status(400).json({ message: 'Файлы не загружены' });
   }
-
   const urls = req.files.map(f => `/uploads/${f.filename}`);
   res.json({ urls });
 });
-// Статика для доступа к файлам
 app.use('/uploads', express.static(UPLOAD_DIR));
-
 
 // Таблицы
 const tableMap = {
@@ -189,8 +254,8 @@ app.get('/api/:category/:id', ensureTable, async (req, res) => {
   }
 });
 
-// POST (создание товара)
-app.post('/api/:category', ensureTable, async (req, res) => {
+// POST (создание товара) - защищён
+app.post('/api/:category', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
     const payload = req.body;
     if (!payload.id) payload.id = uuidv4();
@@ -222,8 +287,8 @@ app.post('/api/:category', ensureTable, async (req, res) => {
   }
 });
 
-// PUT (редактирование товара)
-app.put('/api/:category/:id', ensureTable, async (req, res) => {
+// PUT (редактирование товара) - защищён
+app.put('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const payload = req.body;
@@ -272,19 +337,16 @@ app.put('/api/:category/:id', ensureTable, async (req, res) => {
   }
 });
 
-// DELETE
-app.delete('/api/:category/:id', ensureTable, async (req, res) => {
+// DELETE - защищён
+app.delete('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
-    // сначала получаем запись, чтобы знать, какие изображения удалить
     const selectRes = await db.query(`SELECT images FROM "${req.table}" WHERE id=$1`, [req.params.id]);
     if (!selectRes.rowCount) return res.status(404).json({ error: 'not_found' });
 
     const images = selectRes.rows[0].images || [];
 
-    // удаляем файлы с диска
     images.forEach((url) => {
       try {
-        // предполагаем, что URL вида "/uploads/filename.jpg"
         const filePath = path.join(__dirname, 'uploads', path.basename(url));
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       } catch (e) {
@@ -292,7 +354,6 @@ app.delete('/api/:category/:id', ensureTable, async (req, res) => {
       }
     });
 
-    // удаляем запись из базы
     const result = await db.query(`DELETE FROM "${req.table}" WHERE id=$1 RETURNING id`, [req.params.id]);
     res.json({ deleted: true, id: result.rows[0].id });
   } catch (e) {
