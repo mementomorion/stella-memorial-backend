@@ -14,6 +14,61 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 
 // ⚡️ этот роут вынеси ВЫШЕ всех app.use('/api/:category', ensureTable,...)
+// ⚡️ этот роут вынеси ВЫШЕ всех app.use('/api/:category', ensureTable,...)
+app.get('/bot_call', async (req, res) => {
+  try {
+    console.log('--- /bot_call endpoint called ---');
+    console.log('Query params received:', req.query);
+
+    const { Phone } = req.query;
+
+    if (!Phone) {
+      console.warn('Missing required field: Phone');
+      return res.status(400).json({ error: "Телефон обязателен" });
+    }
+
+    const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8219876383:AAGMovmnKsqXLgEdJ-F4_XNC_GwVaevynGE";
+    const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "-4922810294";
+
+    console.log('Using bot token:', TELEGRAM_BOT_TOKEN);
+    console.log('Sending to chat ID:', TELEGRAM_CHAT_ID);
+
+    const text = `
+📞 *Запрос на обратную связь*  
+
+📱 Телефон: ${Phone}
+`;
+
+    console.log('Message to send:', text);
+
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "Markdown"
+      })
+    });
+
+    console.log('Raw fetch response:', response);
+
+    const data = await response.json();
+    console.log('Telegram API response:', data);
+
+    if (!data.ok) {
+      console.error("Telegram reported an error:", data);
+      return res.status(500).json({ error: "Не удалось отправить сообщение в Telegram", details: data });
+    }
+
+    res.json({ success: true, messageId: data.result.message_id });
+  } catch (e) {
+    console.error("Ошибка /bot_call:", e);
+    res.status(500).json({ error: "Ошибка сервера", details: e.message });
+  }
+});
+
 app.get('/bot', async (req, res) => {
   try {
     console.log('--- /bot endpoint called ---');
@@ -73,7 +128,7 @@ app.get('/bot', async (req, res) => {
 
 
 const JWT_SECRET = process.env.JWT_SECRET || 'replace_this_with_strong_secret';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '12h'; // пример
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '360d'; // пример
 
 // CORS
 app.use(cors({
