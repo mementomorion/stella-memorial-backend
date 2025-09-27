@@ -12,6 +12,18 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+function normalizePayload(payload) {
+  return {
+    ...payload,
+    originalPrice: payload.originalPrice ?? payload.original_price,
+    productionTime: payload.productionTime ?? payload.production_time,
+    installationWarranty: payload.installationWarranty ?? payload.installation_warranty,
+    productWarranty: payload.productWarranty ?? payload.product_warranty,
+    isNew: payload.isNew ?? payload.is_new,
+    isExclusive: payload.isExclusive ?? payload.is_exclusive,
+    materialVariants: payload.materialVariants ?? payload.material_variants,
+  };
+}
 
 // ⚡️ этот роут вынеси ВЫШЕ всех app.use('/api/:category', ensureTable,...)
 // ⚡️ этот роут вынеси ВЫШЕ всех app.use('/api/:category', ensureTable,...)
@@ -145,6 +157,142 @@ app.use((req, res, next) => {
 });
 app.use(express.json()); // для парсинга JSON в POST/PUT запросах
 app.use(express.urlencoded({ extended: true })); // если будут формы
+app.get('/api/materials', async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM materials ORDER BY name ASC');
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/materials/name/:name', authenticateJWT, ensureAdmin, async (req, res) => {
+  try {
+    const { price } = req.body;
+    if (price === undefined) {
+      return res.status(400).json({ error: 'price is required' });
+    }
+
+    const result = await db.query(
+      'UPDATE materials SET price=$1, updated_at=now() WHERE name=$2 RETURNING *',
+      [price, req.params.name]
+    );
+
+    if (!result.rowCount) return res.status(404).json({ error: 'not_found' });
+
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// POST /api/recalculate/prices
+app.post('/api/recalculate/prices', authenticateJWT, ensureAdmin, async (req, res) => {
+  try {
+    // Получаем все памятники
+    const monuments = await db.query(`SELECT id, name, price, material_variants FROM "pamyatniki"`);
+    if (!monuments.rows.length) {
+      return res.json({ message: 'Нет товаров в категории "Памятники"' });
+    }
+
+    // Получаем все материалы
+    const materialsRes = await db.query(`SELECT name, price FROM materials`);
+    const materialsMap = new Map(materialsRes.rows.map(m => [m.name, m.price]));
+
+    const updates = [];
+
+    for (const monument of monuments.rows) {
+      let variants = [];
+
+    try {
+      if (typeof monument.material_variants === 'string') {
+        variants = JSON.parse(monument.material_variants || '[]');
+      } else if (Array.isArray(monument.material_variants)) {
+        variants = monument.material_variants; // уже массив
+      } else {
+        console.warn(`⚠️ material_variants у id=${monument.id} не строка и не массив`, monument.material_variants);
+        continue;
+      }
+    } catch (e) {
+      console.warn(`Ошибка парсинга material_variants у id=${monument.id}`, e);
+      continue;
+    }
+      if (!Array.isArray(variants) || !variants.length) {
+        console.log(`[SKIP] ${monument.name} (${monument.id}) — нет вариантов`);
+        continue;
+      }
+
+      // ищем цены для вариантов по name
+      const variantPrices = variants.map(v => ({
+        name: v?.name,
+        price: v?.name ? Number(materialsMap.get(v.name)) : null
+      }));
+
+      const validPrices = variantPrices
+        .filter(v => typeof v.price === 'number' && !isNaN(v.price))
+        .map(v => v.price);
+
+
+      if (!validPrices.length) {
+        console.log(`[SKIP] ${monument.name} (${monument.id}) — цены не найдены для вариантов:`, variantPrices);
+        continue;
+      }
+
+      const minPrice = Math.min(...validPrices);
+      const newPrice = +(minPrice * 0.025).toFixed(2);
+
+      // Логирование
+      console.log('---');
+      console.log(`Памятник: ${monument.name} (${monument.id})`);
+      console.log(`Старая цена: ${monument.price}`);
+      console.log('Варианты:', variantPrices);
+      console.log(`Минимальная цена материала: ${minPrice}`);
+      console.log(`Новая цена: ${newPrice}`);
+
+      if (newPrice !== monument.price) {
+        await db.query(
+          `UPDATE "pamyatniki" SET price=$1, updated_at=now() WHERE id=$2`,
+          [newPrice, monument.id]
+        );
+        updates.push({ id: monument.id, oldPrice: monument.price, newPrice });
+        console.log(`✅ Цена обновлена: ${monument.price} → ${newPrice}`);
+      } else {
+        console.log('⏩ Цена осталась без изменений');
+      }
+    }
+
+    res.json({
+      message: 'Пересчёт завершён',
+      updated: updates.length,
+      updates
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// безопасный парсер
+function safeParseVariants(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'object') return [raw];
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+
 
 const authLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -312,8 +460,9 @@ app.get('/api/:category/:id', ensureTable, async (req, res) => {
 // POST (создание товара) - защищён
 app.post('/api/:category', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
-    const payload = req.body;
+    const payload = normalizePayload(req.body);
     if (!payload.id) payload.id = uuidv4();
+
     const err = validateProductPayload(payload);
     if (err) return res.status(400).json({ error: err });
 
@@ -326,6 +475,7 @@ app.post('/api/:category', ensureTable, authenticateJWT, ensureAdmin, async (req
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21
       ) RETURNING *;
     `;
+
     const params = [
       payload.id, payload.name, payload.type || null, payload.price, payload.originalPrice || null,
       JSON.stringify(payload.images || []), payload.availability, payload.category, payload.material || null,
@@ -334,6 +484,7 @@ app.post('/api/:category', ensureTable, authenticateJWT, ensureAdmin, async (req
       JSON.stringify(payload.features || []), JSON.stringify(payload.specifications || {}),
       payload.isNew || false, payload.isExclusive || false, JSON.stringify(payload.materialVariants || [])
     ];
+
     const result = await db.query(q, params);
     res.status(201).json(result.rows[0]);
   } catch (e) {
@@ -346,7 +497,8 @@ app.post('/api/:category', ensureTable, authenticateJWT, ensureAdmin, async (req
 app.put('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const payload = req.body;
+    const payload = normalizePayload(req.body);
+
     const allowedFields = [
       'name','type','price','originalPrice','images','availability','category','material','color','polishing',
       'description','productionTime','installationWarranty','productWarranty','dimensions','features','specifications',
@@ -416,6 +568,19 @@ app.delete('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, asyn
     res.status(500).json({ error: e.message });
   }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 const PORT = 4000;
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
