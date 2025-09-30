@@ -190,6 +190,7 @@ app.put('/api/materials/name/:name', authenticateJWT, ensureAdmin, async (req, r
 
 
 // POST /api/recalculate/prices
+// POST /api/recalculate/prices
 app.post('/api/recalculate/prices', authenticateJWT, ensureAdmin, async (req, res) => {
   try {
     // Получаем все памятники
@@ -207,49 +208,41 @@ app.post('/api/recalculate/prices', authenticateJWT, ensureAdmin, async (req, re
     for (const monument of monuments.rows) {
       let variants = [];
 
-    try {
-      if (typeof monument.material_variants === 'string') {
-        variants = JSON.parse(monument.material_variants || '[]');
-      } else if (Array.isArray(monument.material_variants)) {
-        variants = monument.material_variants; // уже массив
-      } else {
-        console.warn(`⚠️ material_variants у id=${monument.id} не строка и не массив`, monument.material_variants);
+      try {
+        if (typeof monument.material_variants === 'string') {
+          variants = JSON.parse(monument.material_variants || '[]');
+        } else if (Array.isArray(monument.material_variants)) {
+          variants = monument.material_variants; // уже массив
+        } else {
+          console.warn(`⚠️ material_variants у id=${monument.id} не строка и не массив`, monument.material_variants);
+          continue;
+        }
+      } catch (e) {
+        console.warn(`Ошибка парсинга material_variants у id=${monument.id}`, e);
         continue;
       }
-    } catch (e) {
-      console.warn(`Ошибка парсинга material_variants у id=${monument.id}`, e);
-      continue;
-    }
+
       if (!Array.isArray(variants) || !variants.length) {
         console.log(`[SKIP] ${monument.name} (${monument.id}) — нет вариантов`);
         continue;
       }
 
-      // ищем цены для вариантов по name
-      const variantPrices = variants.map(v => ({
-        name: v?.name,
-        price: v?.name ? Number(materialsMap.get(v.name)) : null
-      }));
+      // Берём только первый материал
+      const firstVariant = variants[0];
+      const firstPrice = firstVariant?.name ? Number(materialsMap.get(firstVariant.name)) : null;
 
-      const validPrices = variantPrices
-        .filter(v => typeof v.price === 'number' && !isNaN(v.price))
-        .map(v => v.price);
-
-
-      if (!validPrices.length) {
-        console.log(`[SKIP] ${monument.name} (${monument.id}) — цены не найдены для вариантов:`, variantPrices);
+      if (typeof firstPrice !== 'number' || isNaN(firstPrice)) {
+        console.log(`[SKIP] ${monument.name} (${monument.id}) — не найдена цена для первого материала:`, firstVariant);
         continue;
       }
 
-      const minPrice = Math.min(...validPrices);
-      const newPrice = +(minPrice * 0.025).toFixed(2);
+      const newPrice = +(firstPrice * 0.025).toFixed(2);
 
       // Логирование
       console.log('---');
       console.log(`Памятник: ${monument.name} (${monument.id})`);
       console.log(`Старая цена: ${monument.price}`);
-      console.log('Варианты:', variantPrices);
-      console.log(`Минимальная цена материала: ${minPrice}`);
+      console.log(`Первый материал: ${firstVariant.name}, цена = ${firstPrice}`);
       console.log(`Новая цена: ${newPrice}`);
 
       if (newPrice !== monument.price) {
@@ -267,13 +260,14 @@ app.post('/api/recalculate/prices', authenticateJWT, ensureAdmin, async (req, re
     res.json({
       message: 'Пересчёт завершён',
       updated: updates.length,
-      updates
+      details: updates
     });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
+
 
 
 // безопасный парсер
