@@ -16,6 +16,7 @@ psql -U postgres -h localhost -p 5432 -d newdb -f mydb_full.sql
 
 
 Сделать копию.
-pg_dump -U <пользователь> -F c -b -v -f backup.dump memorial_db
-или
-pg_dump -U postgres -h localhost -p 5432 -F c -b -v -f mydb_full.dump memorial_db
+
+pg_dump -U postgres -h localhost -p 5432 -F c -b -v -f memorial_db_0_00_00.dump memorial_db
+
+pg_dump -U postgres -h localhost -p 5432 -F p -f memorial_db_0_00_00.sql memorial_db
