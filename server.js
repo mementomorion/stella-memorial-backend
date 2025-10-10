@@ -32,7 +32,7 @@ app.get('/bot_call', async (req, res) => {
     console.log('--- /bot_call endpoint called ---');
     console.log('Query params received:', req.query);
 
-    const { Phone } = req.query;
+    const { Phone, Name } = req.query;
 
     if (!Phone) {
       console.warn('Missing required field: Phone');
@@ -48,6 +48,7 @@ app.get('/bot_call', async (req, res) => {
     const text = `
 📞 *Запрос на обратную связь*  
 
+🧑‍💼 Имя: ${Name}
 📱 Телефон: ${Phone}
 `;
 
