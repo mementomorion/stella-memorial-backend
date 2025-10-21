@@ -4,14 +4,28 @@ const db = require('./db'); // твоя база PostgreSQL
 const { v4: uuidv4 } = require('uuid');
 const { validateProductPayload } = require('./validators');
 const multer = require('multer');
+const multerS3 = require('multer-s3');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+require('dotenv').config(); // читаем .env
 
 const app = express();
+// --- Настройка клиента S3 ---
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT ,
+  region: process.env.S3_REGION,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY ,
+    secretAccessKey: process.env.S3_SECRET_KEY
+  },
+  forcePathStyle: true
+});
+
 function normalizePayload(payload) {
   return {
     ...payload,
@@ -368,8 +382,21 @@ const storage = multer.diskStorage({
 
 
 const upload = multer({
-  storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // 15MB
+  storage: multerS3({
+    s3,
+    bucket: process.env.S3_BUCKET || '2985832b-stella-s3',
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    key: (req, file, cb) => {
+      // Берём оригинальное имя файла (как на фронтенде)
+      const originalName = file.originalname;
+
+      // Можно добавить поддиректорию, если нужно (например "uploads/")
+      // const key = `uploads/${originalName}`;
+
+      cb(null, originalName);
+    }
+  }),
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|webp/;
     const ext = path.extname(file.originalname).toLowerCase();
@@ -377,15 +404,18 @@ const upload = multer({
     else cb(new Error('Только изображения разрешены'));
   }
 });
-// защита: только админ может грузить файлы
+
+// --- Роут загрузки ---
 app.post('/api/upload', authenticateJWT, ensureAdmin, upload.array('files'), (req, res) => {
   if (!req.files || !req.files.length) {
     return res.status(400).json({ message: 'Файлы не загружены' });
   }
-  const urls = req.files.map(f => `/uploads/${f.filename}`);
+
+  // multer-s3 добавляет прямые ссылки на файлы
+  const urls = req.files.map(f => f.location);
   res.json({ urls });
 });
-app.use('/uploads', express.static(UPLOAD_DIR));
+
 
 // Таблицы
 const tableMap = {
@@ -548,20 +578,38 @@ app.put('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, async (
 app.delete('/api/:category/:id', ensureTable, authenticateJWT, ensureAdmin, async (req, res) => {
   try {
     const selectRes = await db.query(`SELECT images FROM "${req.table}" WHERE id=$1`, [req.params.id]);
-    if (!selectRes.rowCount) return res.status(404).json({ error: 'not_found' });
+    if (!selectRes.rowCount) {
+      return res.status(404).json({ error: 'not_found' });
+    }
 
     const images = selectRes.rows[0].images || [];
 
-    images.forEach((url) => {
+    // --- Удаляем файлы из S3 ---
+    for (const url of images) {
       try {
-        const filePath = path.join(__dirname, 'uploads', path.basename(url));
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      } catch (e) {
-        console.error('Ошибка удаления файла', url, e);
-      }
-    });
+        // Получаем имя объекта из URL
+        const key = decodeURIComponent(url.split('/').pop());
 
-    const result = await db.query(`DELETE FROM "${req.table}" WHERE id=$1 RETURNING id`, [req.params.id]);
+        // Отправляем команду на удаление
+        await s3.send(
+          new DeleteObjectCommand({
+            Bucket: process.env.S3_BUCKET || '2985832b-stella-s3',
+            Key: key
+          })
+        );
+
+        console.log(`🗑️ Удалён из S3: ${key}`);
+      } catch (err) {
+        console.error('Ошибка удаления из S3:', url, err);
+      }
+    }
+
+    // --- Удаляем запись из БД ---
+    const result = await db.query(
+      `DELETE FROM "${req.table}" WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    );
+
     res.json({ deleted: true, id: result.rows[0].id });
   } catch (e) {
     console.error(e);
